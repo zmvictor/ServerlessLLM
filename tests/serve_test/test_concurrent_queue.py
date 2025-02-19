@@ -1,0 +1,160 @@
+"""Tests for concurrent batch queue operations."""
+import json
+import time
+import multiprocessing as mp
+from typing import List, Dict, Any
+
+import pytest
+import redis
+from serverless_llm.serve.batch_queue import push_to_batch_redis_queue, dequeue_based_on_priority
+from serverless_llm.serve.redis_config import PRIORITY_WEIGHTS, BATCH_REDIS_QUEUE_NAMES
+from serverless_llm.serve.redis_client import BatchQueueClient
+
+def create_test_batch(priority: int = 2, batch_id: str = None) -> Dict[str, Any]:
+    """Create a test batch with given priority."""
+    return {
+        "metadata": {
+            "batch_id": batch_id or f"test_batch_{time.time()}",
+            "priority_level": priority,
+            "timestamp": time.time()
+        },
+        "input": "test input"
+    }
+
+def dequeue_worker(queue_name: str, results: List[Dict[str, Any]], max_attempts: int = 20):
+    """Worker function for dequeuing batches."""
+    attempts = 0
+    while attempts < max_attempts:
+        batch = dequeue_based_on_priority(queue_name)
+        if batch:
+            results.append(batch)
+        else:
+            break
+        attempts += 1
+        time.sleep(0.01)  # Small delay to simulate processing
+
+def test_concurrent_dequeue():
+    """Test multiple processes dequeuing simultaneously."""
+    # Setup
+    model = "test_model"
+    BATCH_REDIS_QUEUE_NAMES[model] = "test_queue"
+    queue_name = BATCH_REDIS_QUEUE_NAMES[model]
+    num_processes = 5
+    num_items = 20
+    
+    # Clear queue
+    client = BatchQueueClient()
+    client.client.delete(queue_name)
+    
+    # Add test items with different priorities
+    start_time = time.time()
+    for i in range(num_items):
+        priority = i % 3 + 1  # Priorities 1, 2, 3
+        batch = create_test_batch(priority=priority, batch_id=f"batch_{i}")
+        assert push_to_batch_redis_queue(model, batch)
+    
+    # Create shared list for results
+    manager = mp.Manager()
+    results = manager.list()
+    
+    # Start multiple dequeue processes
+    processes = []
+    for i in range(num_processes):
+        p = mp.Process(
+            target=dequeue_worker,
+            args=(queue_name, results),
+            name=f"dequeue_worker_{i}"
+        )
+        p.start()
+        processes.append(p)
+    
+    # Wait for completion
+    for p in processes:
+        p.join()
+    
+    # Verify results
+    assert len(results) == num_items, f"Expected {num_items} items, got {len(results)}"
+    assert client.client.zcard(queue_name) == 0, "Queue should be empty"
+    
+    # Verify priority ordering
+    priorities = [r["metadata"]["priority_level"] for r in results[:10]]
+    assert priorities.count(1) > priorities.count(2) > priorities.count(3), \
+        "Higher priority items should be dequeued first"
+    
+    # Log performance metrics
+    total_time = time.time() - start_time
+    avg_time_per_item = total_time / num_items
+    print(f"\nPerformance metrics:")
+    print(f"Total time: {total_time:.3f}s")
+    print(f"Average time per item: {avg_time_per_item*1000:.2f}ms")
+    print(f"Items per second: {num_items/total_time:.2f}")
+
+def test_concurrent_enqueue_dequeue():
+    """Test concurrent enqueueing and dequeueing."""
+    model = "test_model"
+    BATCH_REDIS_QUEUE_NAMES[model] = "test_queue_2"
+    queue_name = BATCH_REDIS_QUEUE_NAMES[model]
+    num_producers = 3
+    num_consumers = 3
+    items_per_producer = 10
+    
+    # Clear queue
+    client = BatchQueueClient()
+    client.client.delete(queue_name)
+    
+    # Create shared list for results
+    manager = mp.Manager()
+    results = manager.list()
+    
+    # Producer function
+    def producer(model: str, num_items: int):
+        for i in range(num_items):
+            priority = i % 3 + 1
+            batch = create_test_batch(
+                priority=priority,
+                batch_id=f"batch_p{mp.current_process().name}_i{i}"
+            )
+            push_to_batch_redis_queue(model, batch)
+            time.sleep(0.01)  # Small delay to simulate processing
+    
+    # Start producers and consumers
+    start_time = time.time()
+    processes = []
+    
+    # Start producers
+    for i in range(num_producers):
+        p = mp.Process(
+            target=producer,
+            args=(model, items_per_producer),
+            name=f"producer_{i}"
+        )
+        p.start()
+        processes.append(p)
+    
+    # Start consumers
+    for i in range(num_consumers):
+        c = mp.Process(
+            target=dequeue_worker,
+            args=(queue_name, results),
+            name=f"consumer_{i}"
+        )
+        c.start()
+        processes.append(c)
+    
+    # Wait for completion
+    for p in processes:
+        p.join()
+    
+    # Verify results
+    total_items = num_producers * items_per_producer
+    assert len(results) == total_items, \
+        f"Expected {total_items} items, got {len(results)}"
+    assert client.client.zcard(queue_name) == 0, "Queue should be empty"
+    
+    # Log performance metrics
+    total_time = time.time() - start_time
+    avg_time_per_item = total_time / total_items
+    print(f"\nPerformance metrics:")
+    print(f"Total time: {total_time:.3f}s")
+    print(f"Average time per item: {avg_time_per_item*1000:.2f}ms")
+    print(f"Items per second: {total_items/total_time:.2f}")
