@@ -1,7 +1,7 @@
 """Batch queue implementation using Redis sorted sets."""
 import json
 import time
-from typing import Optional, Any, Dict, Tuple, Union
+from typing import Optional, Any, Dict, Tuple, Union, List
 
 import redis
 from serverless_llm.serve.logger import init_logger
@@ -9,6 +9,101 @@ from serverless_llm.serve.redis_client import BatchQueueClient
 from serverless_llm.serve.redis_config import PRIORITY_WEIGHTS, DECAY_FACTOR, BATCH_REDIS_QUEUE_NAMES
 
 logger = init_logger(__name__)
+
+def migrate_to_sorted_set(model: str, batch_size: int = 100) -> bool:
+    """Migrate existing Redis list to sorted set with atomic queue switch.
+    
+    Args:
+        model: Model identifier
+        batch_size: Number of items to migrate in each batch
+        
+    Returns:
+        bool: True if migration was successful
+    """
+    start_time = time.time()
+    client = BatchQueueClient()
+    
+    try:
+        old_queue = BATCH_REDIS_QUEUE_NAMES[model]
+        new_queue = f"{old_queue}_sorted"
+        backup_queue = f"{old_queue}_backup"
+        
+        # Create backup of original queue
+        logger.info(f"Creating backup of {old_queue}")
+        pipe = client.client.pipeline()
+        pipe.lrange(old_queue, 0, -1)  # Get all items
+        pipe.rename(old_queue, backup_queue)
+        results = pipe.execute()
+        
+        if not results or not results[0]:
+            logger.info(f"Queue {old_queue} is empty or doesn't exist")
+            return True
+            
+        items = results[0]
+        total_items = len(items)
+        migrated_count = 0
+        
+        logger.info(f"Migrating {total_items} items from {old_queue}")
+        
+        # Migrate items in batches
+        for i in range(0, total_items, batch_size):
+            batch_items = items[i:i + batch_size]
+            
+            for item in batch_items:
+                try:
+                    batch_data = json.loads(item)
+                    score = _calculate_score(batch_data)
+                    client.client.zadd(new_queue, {item: score})
+                    migrated_count += 1
+                    
+                except json.JSONDecodeError:
+                    logger.error(f"Failed to parse item: {item[:100]}...")
+                    continue
+                    
+            logger.info(
+                f"Migrated {migrated_count}/{total_items} items "
+                f"({(migrated_count/total_items)*100:.1f}%)"
+            )
+        
+        # Verify migration
+        if migrated_count == total_items:
+            # Atomic queue switch
+            client.client.rename(new_queue, old_queue)
+            logger.info(
+                f"Successfully migrated {migrated_count} items in {time.time()-start_time:.2f}s"
+            )
+            return True
+            
+        else:
+            # Rollback if not all items were migrated
+            logger.error(
+                f"Migration incomplete: {migrated_count}/{total_items} items migrated. "
+                "Rolling back..."
+            )
+            client.client.delete(new_queue)
+            client.client.rename(backup_queue, old_queue)
+            return False
+            
+    except Exception as e:
+        logger.error(f"Migration failed: {e}")
+        # Attempt rollback
+        try:
+            if client.client.exists(backup_queue):
+                client.client.rename(backup_queue, old_queue)
+        except Exception as rollback_error:
+            logger.error(f"Rollback failed: {rollback_error}")
+        return False
+        
+    finally:
+        # Cleanup
+        try:
+            if client.client.exists(backup_queue):
+                client.client.delete(backup_queue)
+            if client.client.exists(new_queue):
+                client.client.delete(new_queue)
+        except Exception as cleanup_error:
+            logger.error(f"Cleanup failed: {cleanup_error}")
+        client.close()
 
 def _calculate_score(batch_data: Dict[str, Any]) -> float:
     """Calculate priority score for a batch.
