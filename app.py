@@ -18,7 +18,13 @@ def load_personas(file_path):
                 file_path = os.path.join(os.getcwd(), file_path)
         else:
             # If file_path is not a string (e.g., it's a temporary file object from Gradio)
-            file_path = file_path.name
+            # Copy file to uploads directory
+            upload_dir = os.path.join(os.path.dirname(__file__), 'uploads')
+            os.makedirs(upload_dir, exist_ok=True)
+            dest_path = os.path.join(upload_dir, os.path.basename(file_path.name))
+            with open(file_path.name, 'rb') as src, open(dest_path, 'wb') as dst:
+                dst.write(src.read())
+            file_path = dest_path
             
         print(f"DEBUG: Attempting to load file from: {file_path}")
         print(f"DEBUG: Current working directory: {os.getcwd()}")
@@ -111,6 +117,11 @@ def create_interface():
             self.current_file = None
             self.current_persona = None
     store = Store()
+    
+    # Set Gradio cache directory to local path
+    cache_dir = os.path.join(os.path.dirname(__file__), 'gradio_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ['GRADIO_TEMP_DIR'] = cache_dir
     
     with gr.Blocks(theme=gr.themes.Soft()) as demo:
         gr.Markdown(
