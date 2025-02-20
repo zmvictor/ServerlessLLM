@@ -1,9 +1,11 @@
 import gradio as gr
 import json
 import os
+import time
 from PIL import Image
 import io
 import sys
+import shutil
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from utils.image_generation import generate_image
@@ -18,12 +20,23 @@ def load_personas(file_path):
                 file_path = os.path.join(os.getcwd(), file_path)
         else:
             # If file_path is not a string (e.g., it's a temporary file object from Gradio)
-            # Copy file to uploads directory
+            # Copy file to uploads directory with unique name
             upload_dir = os.path.join(os.path.dirname(__file__), 'uploads')
-            os.makedirs(upload_dir, exist_ok=True)
-            dest_path = os.path.join(upload_dir, os.path.basename(file_path.name))
-            with open(file_path.name, 'rb') as src, open(dest_path, 'wb') as dst:
-                dst.write(src.read())
+            timestamp = int(time.time())
+            safe_filename = f"{timestamp}_{os.path.basename(file_path.name)}"
+            dest_path = os.path.join(upload_dir, safe_filename)
+            
+            # Copy file with proper error handling
+            try:
+                with open(file_path.name, 'rb') as src:
+                    content = src.read()
+                with open(dest_path, 'wb') as dst:
+                    dst.write(content)
+                os.chmod(dest_path, 0o666)  # Read/write for all users
+            except IOError as e:
+                print(f"DEBUG: Error copying file: {e}")
+                return f"Error copying file: {str(e)}"
+                
             file_path = dest_path
             
         print(f"DEBUG: Attempting to load file from: {file_path}")
@@ -118,10 +131,19 @@ def create_interface():
             self.current_persona = None
     store = Store()
     
-    # Set Gradio cache directory to local path
-    cache_dir = os.path.join(os.path.dirname(__file__), 'gradio_cache')
-    os.makedirs(cache_dir, exist_ok=True)
+    # Set up local directories for uploads and cache
+    base_dir = os.path.dirname(__file__)
+    cache_dir = os.path.join(base_dir, 'gradio_cache')
+    upload_dir = os.path.join(base_dir, 'uploads')
+    
+    # Ensure directories exist with proper permissions
+    for directory in [cache_dir, upload_dir]:
+        os.makedirs(directory, exist_ok=True)
+        os.chmod(directory, 0o777)  # Full permissions for user/group/others
+    
+    # Configure Gradio to use local directories
     os.environ['GRADIO_TEMP_DIR'] = cache_dir
+    os.environ['GRADIO_CACHE_DIR'] = cache_dir
     
     with gr.Blocks(theme=gr.themes.Soft()) as demo:
         gr.Markdown(
