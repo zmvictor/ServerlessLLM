@@ -1,9 +1,10 @@
 """Batch queue implementation using Redis sorted sets."""
 import json
 import time
-from typing import Optional, Any, Dict, Tuple, Union, List
+from typing import Optional, Any, Dict, Tuple, Union, List, cast
 
 import redis
+from redis.client import Pipeline
 from serverless_llm.serve.logger import init_logger
 from serverless_llm.serve.redis_client import BatchQueueClient
 from serverless_llm.serve.redis_config import PRIORITY_WEIGHTS, DECAY_FACTOR, BATCH_REDIS_QUEUE_NAMES
@@ -208,7 +209,9 @@ def dequeue_based_on_priority(queue_name: str) -> Optional[Dict[str, Any]]:
                     logger.debug(f"Queue {queue_name} is empty")
                     return None
                 
-                highest_priority_job, score = results[0]
+                # Cast results to proper type for tuple unpacking
+                result_tuple = cast(List[Tuple[bytes, float]], results)
+                highest_priority_job, score = result_tuple[0]
                 
                 # Start transaction
                 pipe.multi()

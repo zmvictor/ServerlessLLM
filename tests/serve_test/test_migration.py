@@ -1,10 +1,11 @@
 """Tests for Redis queue migration."""
 import json
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 import redis
+import fakeredis
 from serverless_llm.serve.batch_queue import (
     migrate_to_sorted_set,
     push_to_batch_redis_queue,
@@ -13,7 +14,7 @@ from serverless_llm.serve.batch_queue import (
 from serverless_llm.serve.redis_client import BatchQueueClient
 from serverless_llm.serve.redis_config import BATCH_REDIS_QUEUE_NAMES
 
-def create_test_batch(priority: int = 2, batch_id: str = None) -> dict:
+def create_test_batch(priority: int = 2, batch_id: str = "") -> dict:
     """Create a test batch with given priority."""
     return {
         "metadata": {
@@ -24,18 +25,32 @@ def create_test_batch(priority: int = 2, batch_id: str = None) -> dict:
         "input": "test input"
     }
 
-def test_migrate_empty_queue():
+@pytest.fixture
+def mock_redis_client(monkeypatch):
+    """Create fake Redis client."""
+    fake_redis = fakeredis.FakeRedis()
+    
+    class FakeBatchQueueClient:
+        def __init__(self):
+            self.client = fake_redis
+        
+        def close(self):
+            pass
+    
+    monkeypatch.setattr('serverless_llm.serve.redis_client.BatchQueueClient', FakeBatchQueueClient)
+    client = FakeBatchQueueClient()
+    yield client
+    fake_redis.flushall()
+
+def test_migrate_empty_queue(mock_redis_client):
     """Test migration of empty queue."""
     model = "test_model"
     BATCH_REDIS_QUEUE_NAMES[model] = "test_empty_queue"
     
-    client = BatchQueueClient()
-    client.client.delete(BATCH_REDIS_QUEUE_NAMES[model])
-    
     assert migrate_to_sorted_set(model)
-    assert client.client.type(BATCH_REDIS_QUEUE_NAMES[model]) == b"none"
+    assert mock_redis_client.client.type(BATCH_REDIS_QUEUE_NAMES[model]) == b"none"
 
-def test_migrate_list_to_sorted_set():
+def test_migrate_list_to_sorted_set(mock_redis_client):
     """Test migration from list to sorted set."""
     model = "test_model"
     queue_name = "test_migration_queue"
@@ -78,7 +93,7 @@ def test_migrate_list_to_sorted_set():
     assert priorities.count(1) >= priorities.count(2) >= priorities.count(3), \
         "Higher priority items should be dequeued first"
 
-def test_migrate_with_invalid_data():
+def test_migrate_with_invalid_data(mock_redis_client):
     """Test migration with some invalid data in the queue."""
     model = "test_model"
     queue_name = "test_invalid_queue"
@@ -100,7 +115,7 @@ def test_migrate_with_invalid_data():
     assert client.client.type(queue_name) == b"zset"
     assert client.client.zcard(queue_name) == 2
 
-def test_migration_rollback():
+def test_migration_rollback(mock_redis_client):
     """Test rollback on migration failure."""
     model = "test_model"
     queue_name = "test_rollback_queue"

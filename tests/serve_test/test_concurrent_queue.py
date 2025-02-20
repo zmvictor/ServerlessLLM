@@ -2,19 +2,20 @@
 import json
 import time
 import multiprocessing as mp
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import pytest
 import redis
+import fakeredis
 from serverless_llm.serve.batch_queue import push_to_batch_redis_queue, dequeue_based_on_priority
 from serverless_llm.serve.redis_config import PRIORITY_WEIGHTS, BATCH_REDIS_QUEUE_NAMES
 from serverless_llm.serve.redis_client import BatchQueueClient
 
-def create_test_batch(priority: int = 2, batch_id: str = None) -> Dict[str, Any]:
+def create_test_batch(priority: int = 2, batch_id: Optional[str] = None) -> Dict[str, Any]:
     """Create a test batch with given priority."""
     return {
         "metadata": {
-            "batch_id": batch_id or f"test_batch_{time.time()}",
+            "batch_id": batch_id if batch_id is not None else f"test_batch_{time.time()}",
             "priority_level": priority,
             "timestamp": time.time()
         },
@@ -23,17 +24,28 @@ def create_test_batch(priority: int = 2, batch_id: str = None) -> Dict[str, Any]
 
 def dequeue_worker(queue_name: str, results: List[Dict[str, Any]], max_attempts: int = 20):
     """Worker function for dequeuing batches."""
-    attempts = 0
-    while attempts < max_attempts:
-        batch = dequeue_based_on_priority(queue_name)
-        if batch:
+    # Create a new Redis connection for this worker
+    fake_redis = fakeredis.FakeRedis()
+    
+    # Patch BatchQueueClient in this process
+    from unittest.mock import patch
+    with patch('serverless_llm.serve.redis_client.BatchQueueClient') as mock:
+        mock.return_value.client = fake_redis
+        mock.return_value.close = lambda: None
+        
+        attempts = 0
+        while attempts < max_attempts:
+            batch = dequeue_based_on_priority(queue_name)
+            if not batch:
+                break
             results.append(batch)
-        else:
-            break
-        attempts += 1
-        time.sleep(0.01)  # Small delay to simulate processing
+            attempts += 1
+            time.sleep(0.01)  # Small delay to simulate processing
+        
+        # Clean up
+        fake_redis.flushall()
 
-def test_concurrent_dequeue():
+def test_concurrent_dequeue(monkeypatch):
     """Test multiple processes dequeuing simultaneously."""
     # Setup
     model = "test_model"
@@ -89,7 +101,7 @@ def test_concurrent_dequeue():
     print(f"Average time per item: {avg_time_per_item*1000:.2f}ms")
     print(f"Items per second: {num_items/total_time:.2f}")
 
-def test_concurrent_enqueue_dequeue():
+def test_concurrent_enqueue_dequeue(monkeypatch):
     """Test concurrent enqueueing and dequeueing."""
     model = "test_model"
     BATCH_REDIS_QUEUE_NAMES[model] = "test_queue_2"
