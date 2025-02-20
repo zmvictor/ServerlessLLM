@@ -3,13 +3,14 @@ import json
 import time
 import multiprocessing as mp
 from typing import List, Dict, Any, Optional
+from unittest.mock import patch
 
 import pytest
 import redis
 import fakeredis
+from redis import Redis as SyncRedis
 from serverless_llm.serve.batch_queue import push_to_batch_redis_queue, dequeue_based_on_priority
 from serverless_llm.serve.redis_config import PRIORITY_WEIGHTS, BATCH_REDIS_QUEUE_NAMES
-from serverless_llm.serve.redis_client import BatchQueueClient
 
 def create_test_batch(priority: int = 2, batch_id: Optional[str] = None) -> Dict[str, Any]:
     """Create a test batch with given priority."""
@@ -25,14 +26,20 @@ def create_test_batch(priority: int = 2, batch_id: Optional[str] = None) -> Dict
 def dequeue_worker(queue_name: str, results: List[Dict[str, Any]], max_attempts: int = 20):
     """Worker function for dequeuing batches."""
     # Create a new Redis connection for this worker
-    fake_redis = fakeredis.FakeRedis()
+    fake_redis = fakeredis.FakeRedis(decode_responses=False)
     
-    # Patch BatchQueueClient in this process
-    from unittest.mock import patch
-    with patch('serverless_llm.serve.redis_client.BatchQueueClient') as mock:
-        mock.return_value.client = fake_redis
-        mock.return_value.close = lambda: None
+    class MockRedis:
+        def __init__(self, host=None, port=None, decode_responses=None):
+            self.redis = fake_redis
         
+        def __enter__(self):
+            return self.redis
+            
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+    
+    # Patch Redis in this process
+    with patch('redis.Redis', MockRedis):
         attempts = 0
         while attempts < max_attempts:
             batch = dequeue_based_on_priority(queue_name)
@@ -54,9 +61,22 @@ def test_concurrent_dequeue(monkeypatch):
     num_processes = 5
     num_items = 20
     
-    # Clear queue
-    client = BatchQueueClient()
-    client.client.delete(queue_name)
+    # Create Redis mock
+    fake_redis = fakeredis.FakeRedis(decode_responses=False)
+    
+    class MockRedis:
+        def __init__(self, host=None, port=None, decode_responses=None):
+            self.redis = fake_redis
+        
+        def __enter__(self):
+            return self.redis
+            
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+    
+    # Patch Redis and clear queue
+    monkeypatch.setattr('redis.Redis', MockRedis)
+    fake_redis.delete(queue_name)
     
     # Add test items with different priorities
     start_time = time.time()
@@ -86,7 +106,7 @@ def test_concurrent_dequeue(monkeypatch):
     
     # Verify results
     assert len(results) == num_items, f"Expected {num_items} items, got {len(results)}"
-    assert client.client.zcard(queue_name) == 0, "Queue should be empty"
+    assert fake_redis.zcard(queue_name) == 0, "Queue should be empty"
     
     # Verify priority ordering
     priorities = [r["metadata"]["priority_level"] for r in results[:10]]
@@ -110,9 +130,22 @@ def test_concurrent_enqueue_dequeue(monkeypatch):
     num_consumers = 3
     items_per_producer = 10
     
-    # Clear queue
-    client = BatchQueueClient()
-    client.client.delete(queue_name)
+    # Create Redis mock
+    fake_redis = fakeredis.FakeRedis(decode_responses=False)
+    
+    class MockRedis:
+        def __init__(self, host=None, port=None, decode_responses=None):
+            self.redis = fake_redis
+        
+        def __enter__(self):
+            return self.redis
+            
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+    
+    # Patch Redis and clear queue
+    monkeypatch.setattr('redis.Redis', MockRedis)
+    fake_redis.delete(queue_name)
     
     # Create shared list for results
     manager = mp.Manager()
@@ -161,7 +194,7 @@ def test_concurrent_enqueue_dequeue(monkeypatch):
     total_items = num_producers * items_per_producer
     assert len(results) == total_items, \
         f"Expected {total_items} items, got {len(results)}"
-    assert client.client.zcard(queue_name) == 0, "Queue should be empty"
+    assert fake_redis.zcard(queue_name) == 0, "Queue should be empty"
     
     # Log performance metrics
     total_time = time.time() - start_time
